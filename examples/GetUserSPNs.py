@@ -266,7 +266,14 @@ class GetUserSPNs:
 
         # Connect to LDAP
         try:
-            ldapConnection = ldap.LDAPConnection('ldap://%s' % target, self.baseDN, self.__kdcHost)
+            try:
+                ldapConnection = ldap.LDAPConnection('ldap://%s' % target, self.baseDN, self.__kdcHost)
+                ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
+            except Exception as e:
+                logging.warning(f"LDAP over 389 failed: {e}, trying LDAPS...")
+                ldapConnection = ldap.LDAPConnection('ldaps://%s' % target, self.baseDN, self.__kdcHost)
+                ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
+
             if self.__doKerberos is not True:
                 ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
             else:
@@ -311,61 +318,88 @@ class GetUserSPNs:
         answers = []
         logging.debug('Total of records returned %d' % len(resp))
 
+        logging.debug(">> Traitement nouvelle entrée LDAP")
         for item in resp:
-            if isinstance(item, ldapasn1.SearchResultEntry) is not True:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
                 continue
-            mustCommit = False
-            sAMAccountName =  ''
+
+            logging.debug("="*60)
+            logging.debug("Raw LDAP entry:")
+            logging.debug(item.prettyPrint())
+
+            sAMAccountName = ''
             memberOf = ''
             SPNs = []
-            pwdLastSet = ''
+            pwdLastSet = '<unknown>'
+            lastLogon = '<unknown>'
             userAccountControl = 0
-            lastLogon = 'N/A'
             delegation = ''
+
             try:
                 for attribute in item['attributes']:
-                    if str(attribute['type']) == 'sAMAccountName':
-                        sAMAccountName = str(attribute['vals'][0])
-                        mustCommit = True
-                    elif str(attribute['type']) == 'userAccountControl':
-                        userAccountControl = str(attribute['vals'][0])
-                        if int(userAccountControl) & UF_TRUSTED_FOR_DELEGATION:
-                            delegation = 'unconstrained'
-                        elif int(userAccountControl) & UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION:
-                            delegation = 'constrained'
-                    elif str(attribute['type']) == 'memberOf':
-                        memberOf = str(attribute['vals'][0])
-                    elif str(attribute['type']) == 'pwdLastSet':
-                        if str(attribute['vals'][0]) == '0':
-                            pwdLastSet = '<never>'
-                        else:
-                            pwdLastSet = str(datetime.fromtimestamp(self.getUnixTime(int(str(attribute['vals'][0])))))
-                    elif str(attribute['type']) == 'lastLogon':
-                        if str(attribute['vals'][0]) == '0':
-                            lastLogon = '<never>'
-                        else:
-                            lastLogon = str(datetime.fromtimestamp(self.getUnixTime(int(str(attribute['vals'][0])))))
-                    elif str(attribute['type']) == 'servicePrincipalName':
-                        for spn in attribute['vals']:
-                            SPNs.append(str(spn))
+                    attrType = str(attribute['type']).lower()
+                    attrVals = attribute['vals']
 
-                if mustCommit is True:
-                    if int(userAccountControl) & UF_ACCOUNTDISABLE:
-                        logging.debug('Bypassing disabled account %s ' % sAMAccountName)
+                    logging.debug(f"Attribute found: {attrType} -> {attrVals}")
+
+                    if attrType == 'samaccountname':
+                        sAMAccountName = str(attrVals[0])
+                    elif attrType == 'useraccountcontrol':
+                        try:
+                            userAccountControl = int(str(attrVals[0]))
+                            if userAccountControl & UF_TRUSTED_FOR_DELEGATION:
+                                delegation = 'unconstrained'
+                            elif userAccountControl & UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION:
+                                delegation = 'constrained'
+                        except Exception as e:
+                            logging.warning(f"Invalid userAccountControl: {attrVals} ({e})")
+                    elif attrType == 'memberof':
+                        memberOf = ','.join([str(val) for val in attrVals])
+                    elif attrType == 'pwdlastset':
+                        try:
+                            val = int(str(attrVals[0]))
+                            pwdLastSet = '<never>' if val == 0 else str(datetime.fromtimestamp(self.getUnixTime(val)))
+                        except Exception as e:
+                            logging.warning(f"Invalid pwdLastSet: {attrVals} ({e})")
+                            pwdLastSet = '<invalid>'
+                    elif attrType == 'lastlogon':
+                        try:
+                            val = int(str(attrVals[0]))
+                            lastLogon = '<never>' if val == 0 else str(datetime.fromtimestamp(self.getUnixTime(val)))
+                        except Exception as e:
+                            logging.warning(f"Invalid lastLogon: {attrVals} ({e})")
+                            lastLogon = '<invalid>'
+                    elif attrType == 'serviceprincipalname':
+                        SPNs.extend([str(spn) for spn in attrVals])
+
+                if sAMAccountName and SPNs:
+                    if userAccountControl & UF_ACCOUNTDISABLE:
+                        logging.debug(f"Skipping disabled account: {sAMAccountName}")
                     else:
                         for spn in SPNs:
+                            logging.debug(f"Adding SPN: {spn} from account: {sAMAccountName}")
                             answers.append([spn, sAMAccountName, memberOf, pwdLastSet, lastLogon, delegation])
-            except Exception as e:
-                logging.error('Skipping item, cannot process due to error %s' % str(e))
-                pass
+                else:
+                    logging.debug(f"Ignoring entry: missing SPNs or sAMAccountName (got: {sAMAccountName}, SPNs: {SPNs})")
 
+            except Exception as e:
+                logging.warning(f"Error processing LDAP entry: {e}")
+                continue
+
+        
         if len(answers)>0:
             self.printTable(answers, header=[ "ServicePrincipalName", "Name", "MemberOf", "PasswordLastSet", "LastLogon", "Delegation"])
             print('\n\n')
 
             if self.__requestTGS is True or self.__requestUser is not None:
                 # Let's get unique user names and a SPN to request a TGS for
-                users = dict( (vals[1], vals[0]) for vals in answers)
+                users = {}
+                for vals in answers:
+                    if len(vals) >= 2:
+                        users[vals[1]] = vals[0]
+                    else:
+                        logging.warning(f"Ignored invalid answer entry (too short): {vals}")
+
 
                 # Get a TGT for the current user
                 TGT = self.getTGT()
@@ -509,7 +543,7 @@ if __name__ == '__main__':
         executer = GetUserSPNs(username, password, userDomain, targetDomain, options)
         executer.run()
     except Exception as e:
-        if logging.getLogger().level == logging.DEBUG:
-            import traceback
-            traceback.print_exc()
-        logging.error(str(e))
+        import traceback
+        traceback.print_exc()
+        logging.error("FATAL: %s" % str(e))
+

@@ -39,6 +39,9 @@
 from binascii import unhexlify
 from functools import reduce
 from os import urandom
+import zlib
+import struct
+
 # XXX current status:
 # * Done and tested
 #   - AES encryption, checksum, string2key, prf
@@ -603,6 +606,17 @@ class _HMACMD5(_ChecksumProfile):
         if key.enctype != Enctype.RC4:
             raise ValueError('Wrong key type for checksum')
         super(_HMACMD5, cls).verify(key, keyusage, text, cksum)
+        
+class _CRC32Checksum:
+    def __init__(self):
+        self.checksum_type = 0x0007
+
+    def checksum(self, key, usage, data, KdcReqBody=None):
+        return struct.pack('<I', zlib.crc32(data) & 0xffffffff)
+
+    def verify(self, key, usage, data, checksum, KdcReqBody=None):
+        expected = self.checksum(key, usage, data, KdcReqBody)
+        return expected == checksum
 
 
 _enctype_table = {
@@ -619,7 +633,8 @@ _checksum_table = {
     Cksumtype.SHA1_AES128: _SHA1AES128,
     Cksumtype.SHA1_AES256: _SHA1AES256,
     Cksumtype.HMAC_MD5: _HMACMD5,
-    0xffffff76: _HMACMD5
+    0xffffff76: _HMACMD5,
+    0x0007: _CRC32Checksum()
 }
 
 
@@ -701,3 +716,4 @@ def cf2(enctype, key1, key2, pepper1, pepper2):
     e = _get_enctype_profile(enctype)
     return e.random_to_key(_xorbytes(bytearray(prfplus(key1, pepper1, e.seedsize)),
                                      bytearray(prfplus(key2, pepper2, e.seedsize))))
+

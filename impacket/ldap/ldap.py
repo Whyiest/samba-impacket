@@ -111,15 +111,24 @@ class LDAPConnection:
         except socket.error as e:
             raise socket.error('Connection error (%s:%d)' % (targetHost, self._dstPort), e)
 
-        if self._SSL is False:
-            self._socket.connect(sa)
-        else:
-            # Switching to TLS now
-            ctx = SSL.Context(SSL.TLSv1_METHOD)
-            # ctx.set_cipher_list('RC4')
+        if self._SSL:
+            ctx = SSL.Context(SSL.TLS_CLIENT_METHOD)
+
+            # Désactive les protocoles obsolètes
+            ctx.set_options(SSL.OP_NO_SSLv2)
+            ctx.set_options(SSL.OP_NO_SSLv3)
+            ctx.set_options(SSL.OP_NO_TLSv1)
+            ctx.set_options(SSL.OP_NO_TLSv1_1)
+
+            # Accepter les certificats auto-signés (pentest/lab only)
+            ctx.set_verify(SSL.VERIFY_NONE, lambda *args: True)
+
+            # Créer la connexion SSL
             self._socket = SSL.Connection(ctx, self._socket)
             self._socket.connect(sa)
             self._socket.do_handshake()
+
+
 
     def kerberosLogin(self, user, password, domain='', lmhash='', nthash='', aesKey='', kdcHost=None, TGT=None,
                       TGS=None, useCache=True):
@@ -280,7 +289,7 @@ class LDAPConnection:
 
         return True
 
-    def login(self, user='', password='', domain='', lmhash='', nthash='', authenticationChoice='sicilyNegotiate'):
+    def login(self, user='', password='', domain='', lmhash='', nthash='', authenticationChoice='simple'):
         """
         logins into the target system
 

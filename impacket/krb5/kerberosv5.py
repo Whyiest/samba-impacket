@@ -372,25 +372,35 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
     apReq['ap-options'] =  constants.encodeFlags(opts)
     seq_set(apReq,'ticket', ticket.to_asn1)
 
+    # Key Usage 7
+    # TGS-REQ PA-TGS-REQ padata AP-REQ Authenticator (includes
+    # TGS authenticator subkey), encrypted with the TGS session
+    # key (Section 5.5.1)
+    
     authenticator = Authenticator()
     authenticator['authenticator-vno'] = 5
     authenticator['crealm'] = decodedTGT['crealm'].asOctets()
 
     clientName = Principal()
-    clientName.from_asn1( decodedTGT, 'crealm', 'cname')
-
+    clientName.from_asn1(decodedTGT, 'crealm', 'cname')
     seq_set(authenticator, 'cname', clientName.components_to_asn1)
 
     now = datetime.datetime.utcnow()
-    authenticator['cusec'] =  now.microsecond
+    authenticator['cusec'] = now.microsecond
     authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+    # Important pour compatibilité Samba : CRC32 au lieu de GSSAPI
+    authenticator['cksum'] = noValue
+    authenticator['cksum']['cksumtype'] = 0x0007
+    from impacket.krb5.crypto import _checksum_table
+    crc32 = _checksum_table[0x0007]
+    authenticator['cksum']['checksum'] = crc32.checksum(sessionKey, 11, b'', None)
+
+    authenticator['seq-number'] = 0
 
     encodedAuthenticator = encoder.encode(authenticator)
 
-    # Key Usage 7
-    # TGS-REQ PA-TGS-REQ padata AP-REQ Authenticator (includes
-    # TGS authenticator subkey), encrypted with the TGS session
-    # key (Section 5.5.1)
+    
     encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 7, encodedAuthenticator, None)
 
     apReq['authenticator'] = noValue
@@ -401,7 +411,7 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
 
     tgsReq = TGS_REQ()
 
-    tgsReq['pvno'] =  5
+    tgsReq['pvno'] =  5 
     tgsReq['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
     tgsReq['padata'] = noValue
     tgsReq['padata'][0] = noValue
@@ -424,14 +434,7 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
 
     reqBody['till'] = KerberosTime.to_asn1(now)
     reqBody['nonce'] = rand.getrandbits(31)
-    seq_set_iter(reqBody, 'etype',
-                      (
-                          int(constants.EncryptionTypes.rc4_hmac.value),
-                          int(constants.EncryptionTypes.des3_cbc_sha1_kd.value),
-                          int(constants.EncryptionTypes.des_cbc_md5.value),
-                          int(cipher.enctype)
-                       )
-                )
+    seq_set_iter(reqBody, 'etype', (int(constants.EncryptionTypes.rc4_hmac.value),))
 
     message = encoder.encode(tgsReq)
 
@@ -656,25 +659,27 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
 
     authenticator = Authenticator()
     authenticator['authenticator-vno'] = 5
-    authenticator['crealm'] = domain
-    seq_set(authenticator, 'cname', userName.components_to_asn1)
-    now = datetime.datetime.utcnow()
+    authenticator['crealm'] = decodedTGT['crealm'].asOctets()
 
+    clientName = Principal()
+    clientName.from_asn1(decodedTGT, 'crealm', 'cname')
+    seq_set(authenticator, 'cname', clientName.components_to_asn1)
+
+    now = datetime.datetime.utcnow()
     authenticator['cusec'] = now.microsecond
     authenticator['ctime'] = KerberosTime.to_asn1(now)
 
-    
+    # CRC32 à la place de GSSAPI (fixe pour Samba)
     authenticator['cksum'] = noValue
-    authenticator['cksum']['cksumtype'] = 0x8003
+    authenticator['cksum']['cksumtype'] = 0x0007
+    from impacket.krb5.crypto import _checksum_table
+    crc32 = _checksum_table[0x0007]
+    authenticator['cksum']['checksum'] = crc32.checksum(sessionKey, 11, b'', None)
 
-    chkField = CheckSumField()
-    chkField['Lgth'] = 16
-
-    chkField['Flags'] = GSS_C_CONF_FLAG | GSS_C_INTEG_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | GSS_C_MUTUAL_FLAG | GSS_C_DCE_STYLE
-    #chkField['Flags'] = GSS_C_INTEG_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG | GSS_C_MUTUAL_FLAG | GSS_C_DCE_STYLE
-    authenticator['cksum']['checksum'] = chkField.getData()
     authenticator['seq-number'] = 0
+
     encodedAuthenticator = encoder.encode(authenticator)
+
 
     # Key Usage 11
     # AP-REQ Authenticator (includes application authenticator
